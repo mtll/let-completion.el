@@ -1,0 +1,30 @@
+#+title: Let-binding values in Elisp completion
+
+=let-completion-mode= promotes local variables from enclosing binding forms to
+the top of the completion candidate list, annotates each with its binding value
+when short enough or a =[local]= tag otherwise, and provides the full
+pretty-printed fontified expression in corfu-popupinfo or any completion UI that
+reads =:company-doc-buffer=. Value extraction walks the raw buffer text of
+literal =let=, =let*=, =when-let*=, =if-let*=, =and-let*=, =dolist=, and
+=dotimes= binding lists. Names from forms the built-in =elisp--local-variables=
+misses (untrusted buffers, macroexpansion failure) are injected into the
+completion table directly so they always appear as candidates. The package
+installs a single around-advice on =elisp-completion-at-point= when enabled and
+removes it when disabled.
+
+** Screenshots
+
+[[https://github.com/gggion/let-completion/blob/screenshots/showcase.gif?raw=true]]
+
+** Configuration
+
+#+begin_src emacs-lisp
+;; Enable for Emacs Lisp buffers.
+(add-hook 'emacs-lisp-mode-hook #'let-completion-mode)
+
+;; Show inline values up to 5 characters (the default).
+;; Set to nil to always show [local] instead.
+;; (setq let-completion-inline-max-width 5)
+#+end_src
+#+end_example
+
