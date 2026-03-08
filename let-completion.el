@@ -2,7 +2,7 @@
 
 ;; Author: Gino Cornejo <gggion123@gmail.com>
 ;; Maintainer: Gino Cornejo <gggion123@gmail.com>
-;; Homepage: https://github.com/gggion/let-completion
+;; URL: https://github.com/gggion/let-completion.el
 ;; Keywords: lisp, completion
 
 ;; Package-Version: 0.1.0
