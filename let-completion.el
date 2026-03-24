@@ -95,8 +95,10 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
 
 (defconst let-completion--empty-value (make-symbol "empty"))
 
+(cl-defgeneric let-completion--local-variables-1 (vars sexp))
+
 ;; From `elisp--local-variables-1'
-(defun let-completion--local-variables-1 (vars sexp)
+(cl-defmethod let-completion--local-variables-1 (vars sexp)
   "Return VARS locally bound around the witness, or nil if not found."
   (let (res)
     (while
@@ -145,6 +147,42 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
           (setq sexp (ignore-errors (butlast sexp)))))
     res))
 
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head dolist)))
+  (pcase sexp
+    (`(dolist (,var ,val . ,_) . ,body)
+     (let-completion--local-variables-1 (cons (cons var val) vars)
+                                        (macroexp-progn body)))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head defun)))
+  (pcase sexp
+    (`(defun ,_name ,arglist . ,body)
+     (let-completion--local-variables-1 (append arglist vars)
+                                        (macroexp-progn body)))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-defun)))
+  (pcase sexp
+    (`(cl-defun ,name ,arglist . ,body)
+     (let-completion--local-variables-1
+      vars
+      (car (last (cl--transform-lambda (cons arglist body) name)))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-defmethod)))
+  (pop sexp)
+  (while (cl-generic--method-qualifier-p (car sexp))
+    (pop sexp))
+  (let-completion--local-variables-1
+   (nconc (cdr (cl--generic-split-args (pop sexp)))
+          vars)
+   (macroexp-progn sexp)))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-loop)))
+  (let-completion--local-variables-1 vars (macroexpand-1 sexp)))
+
 ;; From `elisp--local-variables'
 (defun let-completion--local-variables ()
   "Return a list of locally let-bound variables at point."
@@ -163,17 +201,18 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
                      ((invalid-read-syntax end-of-file) nil)))
              (vars (let-completion--local-variables-1
                     nil (elisp--safe-macroexpand-all sexp))))
-        (delq nil
-              (mapcar (lambda (form)
-                        (pcase-let (((or `(,var . ,val) var) form))
-                          (and (symbolp var)
-                               (not (string-match (symbol-name var) "\\`[&_]"))
-                               ;; Eliminate uninterned vars.
-                               (intern-soft var)
-                               (propertize (symbol-name var)
-                                           'let-completion-value
-                                           (or val let-completion--empty-value)))))
-                      vars))))))
+        (delete-dups
+         (delq nil
+               (mapcar (lambda (form)
+                         (pcase-let (((or `(,var . ,val) var) form))
+                           (and (symbolp var)
+                                (not (string-match (symbol-name var) "\\`[&_]"))
+                                ;; Eliminate uninterned vars.
+                                (intern-soft var)
+                                (propertize (symbol-name var)
+                                            'let-completion-value
+                                            (or val let-completion--empty-value)))))
+                       vars)))))))
 
 ;; From `elisp--local-variables-completion-table'
 (defconst let-completion--local-variables-completion-table
@@ -231,7 +270,9 @@ Installed as `:around' advice on `elisp-completion-at-point' by
                 (plist-get plist :annotation-function)
                 (lambda (c)
                   (pcase (get-text-property 0 'let-completion-value c)
-                    ((and val (pred (not (eq let-completion--empty-value))))
+                    ((and val
+                          (guard (or (not (symbolp val))
+                                     (intern-soft val))))
                      (let ((short (and let-completion-inline-max-width
                                        (prin1-to-string val))))
                        (format let-completion-annotation-format
@@ -243,7 +284,9 @@ Installed as `:around' advice on `elisp-completion-at-point' by
                 (plist-get plist :company-doc-buffer)
                 (lambda (c)
                   (pcase (get-text-property 0 'let-completion-value c)
-                    ((and val (pred (not (eq let-completion--empty-value))))
+                    ((and val
+                          (guard (or (not (symbolp val))
+                                     (intern-soft val))))
                      (let ((buf (let-completion--doc-buffer)))
                        (with-current-buffer buf
                          (let ((inhibit-read-only t)
