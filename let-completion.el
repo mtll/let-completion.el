@@ -147,12 +147,114 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
           (setq sexp (ignore-errors (butlast sexp)))))
     res))
 
+(defun let-completion--walk-pcase-pat (vars pat)
+  (let ((pat (pcase--macroexpand pat))
+        (pvars nil))
+    (cl-labels ((walk (pat)
+                  (pcase pat
+                    (`(app ,_ ,pat)
+                     (walk pat))
+                    (`(,(or 'and 'or) . ,pats)
+                     (mapc #'walk pats))
+                    ('elisp--witness--lisp
+                     (throw 'pcase-return
+                            (nconc pvars vars)))
+                    ((pred symbolp)
+                     (push pat pvars)))))
+      (walk pat))
+    pvars))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head pcase)))
+  (pcase sexp
+    (`(,_ ,form . ,cases)
+     (or (let-completion--local-variables-1 vars form)
+         (catch 'pcase-return
+           (pcase-dolist (`(,pat . ,body) cases)
+             (let ((pvars (let-completion--walk-pcase-pat vars pat)))
+               (when-let* ((res (let-completion--local-variables-1
+                                 vars (macroexp-progn body))))
+                 (throw 'pcase-return (nconc pvars res))))))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head pcase-let)))
+  (pcase sexp
+    (`(,_ ,bindings . ,body)
+     (let ((pat-vars nil))
+       (catch 'pcase-return
+         (pcase-dolist (`(,pat ,exp) bindings)
+           (let ((pvars (let-completion--walk-pcase-pat vars pat)))
+             (when-let* ((res (let-completion--local-variables-1 vars exp)))
+               (throw 'pcase-return res))
+             (cl-callf2 nconc pvars pat-vars)))
+         (let-completion--local-variables-1
+          (nconc pat-vars vars)
+          (macroexp-progn body)))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head pcase-let*)))
+  (pcase sexp
+    (`(,_ ,bindings . ,body)
+     (catch 'pcase-return
+       (pcase-dolist (`(,pat ,exp) bindings)
+         (let ((pvars (let-completion--walk-pcase-pat vars pat)))
+           (when-let* ((res (let-completion--local-variables-1 vars exp)))
+             (throw 'pcase-return res))
+           (cl-callf2 nconc pvars vars)))
+       (let-completion--local-variables-1
+        vars (macroexp-progn body))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head pcase-lambda)))
+  (pcase sexp
+    (`(,_ ,arglist . ,body)
+     (catch 'pcase-return
+       (let-completion--local-variables-1
+        (nconc (mapcan (lambda (p) (let-completion--walk-pcase-pat vars p))
+                       arglist)
+               vars)
+        (macroexp-progn body))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head pcase-dolist)))
+  (pcase sexp
+    (`(,_ (,pat ,exp) . ,body)
+     (catch 'pcase-return
+       (let ((pvars (let-completion--walk-pcase-pat vars pat)))
+         (or (let-completion--local-variables-1 vars exp)
+             (let-completion--local-variables-1 (nconc pvars vars)
+                                                (macroexp-progn body))))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head define-inline)))
+  (let-completion--local-variables-1 vars (cons 'defun (cdr sexp))))
+
 (cl-defmethod let-completion--local-variables-1 (vars
                                                  (sexp (head dolist)))
   (pcase sexp
     (`(dolist (,var ,val . ,_) . ,body)
      (let-completion--local-variables-1 (cons (cons var val) vars)
                                         (macroexp-progn body)))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-do)))
+  (pcase sexp
+    (`(,_ ,bindings ,test . ,body)
+     (let-completion--local-variables-1
+      vars
+      `(let ,(mapcar (lambda (binding) (take 2 binding)) bindings)
+         ,@test
+         ,@body)))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-do*)))
+  (pcase sexp
+    (`(,_ ,bindings ,test . ,body)
+     (let-completion--local-variables-1
+      vars
+      `(let* ,(mapcar (lambda (binding) (take 2 binding)) bindings)
+         ,@test
+         ,@body)))))
 
 (cl-defmethod let-completion--local-variables-1 (vars
                                                  (sexp (head defun)))
@@ -162,12 +264,26 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
                                         (macroexp-progn body)))))
 
 (cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-function)))
+  (let-completion--local-variables-1 vars (macroexpand-1 sexp)))
+
+(cl-defmethod let-completion--local-variables-1 (vars
                                                  (sexp (head cl-defun)))
   (pcase sexp
     (`(cl-defun ,name ,arglist . ,body)
      (let-completion--local-variables-1
       vars
       (car (last (cl--transform-lambda (cons arglist body) name)))))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-defsubst)))
+  (let-completion--local-variables-1
+   vars (cons 'cl-defun (cdr sexp))))
+
+(cl-defmethod let-completion--local-variables-1 (vars
+                                                 (sexp (head cl-defmacro)))
+  (let-completion--local-variables-1
+   vars (cons 'cl-defun (cdr sexp))))
 
 (cl-defmethod let-completion--local-variables-1 (vars
                                                  (sexp (head cl-defmethod)))
@@ -179,12 +295,13 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
           vars)
    (macroexp-progn sexp)))
 
-(cl-defmethod let-completion--local-variables-1 (vars
-                                                 (sexp (head cl-loop)))
-  (let-completion--local-variables-1 vars (macroexpand-1 sexp)))
+;; Is `macroexpand-1'ing a `cl-loop' dangerous?
+;; (cl-defmethod let-completion--local-variables-1 (vars
+;;                                                  (sexp (head cl-loop)))
+;;   (let-completion--local-variables-1 vars (macroexpand-1 sexp)))
 
 ;; From `elisp--local-variables'
-(defun let-completion--local-variables ()
+(defun let-completion--local-variables (extract &optional macroexpand)
   "Return a list of locally let-bound variables at point."
   (save-excursion
     (skip-syntax-backward "w_")
@@ -199,8 +316,9 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
                        (car (read-from-string
                              (concat txt "elisp--witness--lisp" closer)))
                      ((invalid-read-syntax end-of-file) nil)))
-             (vars (let-completion--local-variables-1
-                    nil (elisp--safe-macroexpand-all sexp))))
+             (vars
+              (funcall extract nil (if (not macroexpand) sexp
+                                     (elisp--safe-macroexpand-all sexp)))))
         (delete-dups
          (delq nil
                (mapcar (lambda (form)
@@ -230,8 +348,117 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
            (unless (equal lastpos newpos)
              (add-hook 'post-command-hook hook-sym)
              (setq lastpos newpos)
-             (setq lastvars (let-completion--local-variables)))))
+             (setq lastvars (let-completion--local-variables
+                             #'let-completion--local-variables-1 t)))))
        lastvars))))
+
+(cl-defgeneric let-completion--local-functions-1 (vars sexp))
+
+(cl-defmethod let-completion--local-functions-1 (vars sexp)
+  "Return VARS locally bound around the witness, or nil if not found."
+  (let (res)
+    (while
+        (unless
+            (setq res
+                  (pcase sexp
+                    (`(,(or 'let 'let*) ,bindings)
+                     (let-completion--local-functions-1
+                      vars (car (cdr-safe (car (last bindings))))))
+                    (`(,(or 'let 'let*) ,_bindings . ,body)
+                     (let-completion--local-functions-1 vars (car (last body))))
+                    (`(lambda ,_args)
+                     ;; FIXME: Look for the witness inside `args'.
+                     (setq sexp nil))
+                    (`(lambda ,_args . ,body)
+                     (let-completion--local-functions-1 vars (car (last body))))
+                    (`(condition-case ,_ ,e)
+                     (let-completion--local-functions-1 vars e))
+                    (`(condition-case ,_ ,_ . ,catches)
+                     (let-completion--local-functions-1
+                      vars (cdr (car (last catches)))))
+                    (`(quote . ,_)
+                     ;; FIXME: Look for the witness inside sexp.
+                     (setq sexp nil))
+                    ;; FIXME: Handle `cond'.
+                    (`(,_ . ,_)
+                     (let-completion--local-functions-1 vars (car (last sexp))))
+                    ('elisp--witness--lisp (or vars '(nil)))
+                    (_ nil)))
+          ;; We didn't find the witness in the last element so we try to
+          ;; backtrack to the last-but-one.
+          (setq sexp (ignore-errors (butlast sexp)))))
+    res))
+
+(cl-defmethod let-completion--local-functions-1 (vars
+                                                 (sexp (head cl-labels)))
+  (let-completion--local-functions-1
+   (append (mapcar (lambda (binding)
+                     (cons (car binding)
+                           (pcase (cdr binding)
+                             (`(#',fn) `#',fn)
+                             (def (cons 'lambda def)))))
+                   (cadr sexp))
+           vars)
+   (macroexp-progn (cddr sexp))))
+
+(cl-defmethod let-completion--local-functions-1 (vars
+                                                 (sexp (head cl-flet)))
+  (let-completion--local-functions-1
+   (append (mapcar (lambda (binding)
+                     (cons (car binding)
+                           (pcase (cdr binding)
+                             (`(#',fn) `#',fn)
+                             (def (cons 'lambda def)))))
+                   (cadr sexp))
+           vars)
+   (macroexp-progn (cddr sexp))))
+
+(defconst let-completion--local-functions-completion-table
+  (let ((lastpos nil)
+        (lastvars nil)
+        (hook-sym (make-symbol "hook")))
+    (fset hook-sym (lambda ()
+                     (setq lastpos nil)
+                     (remove-hook 'post-command-hook hook-sym)))
+    (completion-table-dynamic
+     (lambda (_string)
+       (save-excursion
+         (skip-syntax-backward "_w")
+         (let ((newpos (cons (point) (current-buffer))))
+           (unless (equal lastpos newpos)
+             (add-hook 'post-command-hook hook-sym)
+             (setq lastpos newpos)
+             (setq lastvars (let-completion--local-variables
+                             #'let-completion--local-functions-1)))))
+       lastvars))))
+
+(defun let-completion--completion-local-symbols-advice (table)
+  (let ((tables
+         (list let-completion--local-functions-completion-table
+               table)))
+    (lambda (string pred action)
+      (add-function :before-until (var pred)
+                    (lambda (val) (stringp val)))
+      (cond
+       ((null action)
+        (let ((retvals (mapcar (lambda (table)
+                                 (try-completion string table pred))
+                               tables)))
+          (if (member string retvals)
+              string
+            (try-completion string
+                            (mapcar (lambda (value)
+                                      (if (eq value t) string value))
+                                    (delq nil retvals))
+                            pred))))
+       ((eq action t)
+        (apply #'append (mapcar (lambda (table)
+                                  (all-completions string table pred))
+                                tables)))
+       (t
+        (seq-some (lambda (table)
+                    (complete-with-action action table string pred))
+                  tables))))))
 
 (defun let-completion--advice (orig-fn)
   "Enrich the capf result from ORIG-FN with let-binding metadata.
@@ -249,8 +476,11 @@ function to defeat truncation imposed by `corfu-popupinfo'.
 Installed as `:around' advice on `elisp-completion-at-point' by
 `let-completion-mode'.  Removed by disabling the mode."
   (let ((result
-         (let ((elisp--local-variables-completion-table
-                let-completion--local-variables-completion-table))
+         (cl-letf (((symbol-function 'elisp--completion-local-symbols))
+                   (elisp--local-variables-completion-table
+                    let-completion--local-variables-completion-table))
+           (advice-add 'elisp--completion-local-symbols :filter-return
+                       #'let-completion--completion-local-symbols-advice)
            (funcall orig-fn))))
     (if (and result (listp result) (>= (length result) 3))
         (let* ((plist (drop 3 result))
@@ -266,27 +496,35 @@ Installed as `:around' advice on `elisp-completion-at-point' by
                                     (push c local)
                                   (push c other))))
                             (nconc (nreverse local) (nreverse other))))))
+          (when (plist-get plist :predicate)
+            (add-function :around (plist-get plist :predicate)
+                          (lambda (fn str)
+                            (if (stringp str)
+                                (get-text-property 0 'let-completion-value str)
+                              (funcall fn str)))))
           (setf (plist-get plist :display-sort-function) sort-fn
                 (plist-get plist :annotation-function)
                 (lambda (c)
                   (pcase (get-text-property 0 'let-completion-value c)
-                    ((and val
-                          (guard (or (not (symbolp val))
-                                     (intern-soft val))))
+                    ('nil
+                     (when orig-ann (funcall orig-ann c)))
+                    ((pred (eq let-completion--empty-value))
+                     (format let-completion-annotation-format "local"))
+                    (val
                      (let ((short (and let-completion-inline-max-width
                                        (prin1-to-string val))))
                        (format let-completion-annotation-format
                                (or (and (<= (length short)
                                             let-completion-inline-max-width)
                                         short)
-                                   "local"))))
-                    (_ (when orig-ann (funcall orig-ann c)))))
+                                   "local"))))))
                 (plist-get plist :company-doc-buffer)
                 (lambda (c)
                   (pcase (get-text-property 0 'let-completion-value c)
-                    ((and val
-                          (guard (or (not (symbolp val))
-                                     (intern-soft val))))
+                    ((pred (eq let-completion--empty-value))
+                     (format let-completion-annotation-format "local"))
+                    ('nil (when orig-doc (funcall orig-doc c)))
+                    (val
                      (let ((buf (let-completion--doc-buffer)))
                        (with-current-buffer buf
                          (let ((inhibit-read-only t)
@@ -295,8 +533,7 @@ Installed as `:around' advice on `elisp-completion-at-point' by
                            (erase-buffer)
                            (insert (pp-to-string val))
                            (font-lock-ensure)))
-                       buf))
-                    (_ (when orig-doc (funcall orig-doc c))))))
+                       buf)))))
           (append (take 3 result) plist))
       result)))
 
@@ -309,6 +546,7 @@ When enabled, install `let-completion--advice' around
 Also see `let-completion-inline-max-width'."
   :lighter nil
   :group 'let-completion
+  :global t
   (if let-completion-mode
       (advice-add 'elisp-completion-at-point :around
                   #'let-completion--advice)
