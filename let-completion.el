@@ -53,7 +53,9 @@
 
 ;;; Code:
 
-(require 'cl-lib)
+(require 'elisp-mode)
+(eval-when-compile
+  (require 'cl-lib))
 
 (defgroup let-completion nil
   "Show let-binding values in Elisp completion."
@@ -142,7 +144,7 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
                      (let-completion--local-variables-1 vars `(let ,spec-list ,@body)))
                     (`(,(or 'dlet 'cl-symbol-macrolet) . ,_)
                      (let-completion--local-variables-1 vars (cons 'let (cdr sexp))))
-                    (`(,(or 'when-let* 'and-let*) . ,_)
+                    (`(,(or 'when-let* 'and-let* 'while-let) . ,_)
                      (let-completion--local-variables-1 vars (cons 'let* (cdr sexp))))
                     (`(if-let* ,bindings ,then . ,else)
                      (or (let-completion--local-variables-1 vars `(let* ,bindings ,then))
@@ -199,7 +201,7 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
     (pcase sexp
       (`(pcase ,form . ,cases)
        (or (let-completion--local-variables-1 vars form)
-           (pcase-dolist (`(,pat . ,body) cases)
+           (pcase-dolist (`(,pat . ,body) (reverse cases))
              (let ((pvars (let-completion--walk-pcase-pat vars pat)))
                (when-let* ((res (let-completion--local-variables-1
                                  vars (macroexp-progn body))))
@@ -397,17 +399,17 @@ Called by `let-completion--advice' for `:company-doc-buffer'."
                                                  (sexp (head cl-labels)))
   (pcase sexp
     (`(,_ ,fbindings . ,body)
-     (let* ((fbodies nil)
-            (fvars (mapcar (lambda (binding)
-                             (cons (car binding)
-                                   (car (pcase (cdr binding)
-                                          (`(#',fn) `#',fn)
-                                          (def
-                                           (car (push (cons 'lambda def)
-                                                      fbodies)))))))
-                           fbindings)))
+     (let* ((fbodies nil))
        (let-completion--local-functions-1
-        (nconc fvars vars)
+        (nconc
+         (mapcar (lambda (binding)
+                   (cons (car binding)
+                         (car (pcase (cdr binding)
+                                (`(#',fn) `#',fn)
+                                (def
+                                 (car (push (cons 'lambda def) fbodies)))))))
+                 fbindings)
+         vars)
         `(progn ,@fbodies ,@body))))))
 
 (cl-defmethod let-completion--local-functions-1 (vars
